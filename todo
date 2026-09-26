@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""todo - SQLite-backed daily todo list for OpenClaw (Jamie Jensen).
+
+Design notes live in STATUS.md next to this file.
+Requires only the Python 3 standard library.
+
+Default DB: ~/.openclaw/state/todos/todos.db  (override: --db PATH or $TODO_DB)
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import os
+import sqlite3
+import sys
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
+
+TZ = os.environ.get("TODO_TZ", "America/Chicago")
+MAX_DESC = 120
+DEFAULT_DB = os.path.expanduser(os.environ.get("TODO_DB", "~/.openclaw/state/todos/todos.db"))
+
+STATE_PENDING = "not-done"
+STATE_DONE = "done"
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS todos (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_day  TEXT NOT NULL,                       -- YYYY-MM-DD
+    state        TEXT NOT NULL DEFAULT 'not-done'
+                 CHECK (state IN ('not-done', 'done')),
+    description  TEXT NOT NULL
+                 CHECK (length(description) BETWEEN 1 AND 120),
+    sort_order   INTEGER NOT NULL DEFAULT 0,
+    created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_todos_day   ON todos(created_day);
+CREATE INDEX IF NOT EXISTS idx_todos_state ON todos(state);
+"""
+
+
+def today_str() -> str:
+    return datetime.now(ZoneInfo(TZ)).strftime("%Y-%m-%d")
+
+
+def days_aged(day: str, ref_day: str) -> int:
+    d = (date.fromisoformat(ref_day) - date.fromisoformat(day)).days
+    return d if d > 0 else 1
+
+
+def connect(db_path: str) -> sqlite3.Connection:
+    os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(SCHEMA)
+    return conn
+
+
+# ---------------------------------------------------------------- rendering
+
+def render(conn: sqlite3.Connection, ref_day: str | None = None) -> str:
+    ref_day = ref_day or today_str()
+    today_rows = conn.execute(
+        "SELECT * FROM todos WHERE created_day = ? ORDER BY sort_order, id", (ref_day,)
+    ).fetchall()
+
+    older = conn.execute(
+        "SELECT * FROM todos WHERE created_day < ? AND state = ? ORDER BY created_day, sort_order, id",
+        (ref_day, STATE_PENDING),
+    ).fetchall()
+    aged: dict[int, list[sqlite3.Row]] = {}
+    for row in older:
+        aged.setdefault(days_aged(row["created_day"], ref_day), []).append(row)
+
+    lines: list[str] = []
+    lines.append(f"Today's list ({ref_day}):")
+    if not today_rows:
+        lines.append("(empty)")
+    else:
+        for i, row in enumerate(today_rows, 1):
+            mark = "[x]" if row["state"] == STATE_DONE else "[ ]"
+            lines.append(f"{i}. {mark} {row['description']}")
+
+    remaining = sum(1 for d in aged.values() for _ in d)
+    lines.append("")
+    if remaining == 0:
+        lines.append("Days Aged: none outstanding")
+    else:
+        for aged_days in sorted(aged, reverse=True):
+            lines.append(f"Days Aged: {aged_days}")
+            for i, row in enumerate(aged[aged_days], 1):
+                lines.append(f"{i}. [ ] {row['description']}")
+    return "\n".join(lines)
+
+
+def resolve(conn: sqlite3.Connection, ref_day: str, num: int, scope: str = "all") -> sqlite3.Row:
+    """Resolve a display number to a row, using the same ordering as render()."""
+    if scope == "today":
+        rows = conn.execute(
+            "SELECT * FROM todos WHERE created_day = ? ORDER BY sort_order, id", (ref_day,)
+        ).fetchall()
+        groups = [rows]
+    else:
+        today_rows = conn.execute(
+            "SELECT * FROM todos WHERE created_day = ? ORDER BY sort_order, id", (ref_day,)
+        ).fetchall()
+        older = conn.execute(
+            "SELECT * FROM todos WHERE created_day < ? AND state = ? ORDER BY created_day, sort_order, id",
+            (ref_day, STATE_PENDING),
+        ).fetchall()
+        aged: dict[int, list[sqlite3.Row]] = {}
+        for row in older:
+            aged.setdefault(days_aged(row["created_day"], ref_day), []).append(row)
+        groups = [today_rows] + [aged[k] for k in sorted(aged, reverse=True)]
+
+    flat = [row for group in groups for row in group]
+    if num < 1 or num > len(flat):
+        raise IndexError(num)
+    return flat[num - 1]
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_init(conn, args) -> str:
+    day = args.day or today_str()
+    existing = conn.execute(
+        "SELECT COUNT(*) AS c FROM todos WHERE created_day = ?", (day,)
+    ).fetchone()["c"]
+    if existing and not args.force:
+        return (
+            f"{existing} item(s) already exist for {day}.\n"
+            "Refusing to re-init. Delete them first (./todo clear --yes) and retry."
+        )
+    added = 0
+    for desc in args.items:
+        desc = desc.strip()
+        if not desc:
+            continue
+        if len(desc) > MAX_DESC:
+            desc = desc[:MAX_DESC]
+        order = conn.execute(
+            "SELECT COALESCE(MAX(sort_order), 0) + 1 AS n FROM todos WHERE created_day = ?", (day,)
+        ).fetchone()["n"]
+        conn.execute(
+            "INSERT INTO todos (created_day, state, description, sort_order, created_at) VALUES (?,?,?,?,?)",
+            (day, STATE_PENDING, desc, order, datetime.now(ZoneInfo(TZ)).isoformat(timespec="seconds")),
+        )
+        added += 1
+    conn.commit()
+    return f"Added {added} item(s) to {day}.\n\n" + render(conn)
+
+
+def cmd_add(conn, args) -> str:
+    day = args.day or today_str()
+    added = 0
+    for desc in args.items:
+        desc = desc.strip()
+        if not desc:
+            continue
+        if len(desc) > MAX_DESC:
+            desc = desc[:MAX_DESC]
+        order = conn.execute(
+            "SELECT COALESCE(MAX(sort_order), 0) + 1 AS n FROM todos WHERE created_day = ?", (day,)
+        ).fetchone()["n"]
+        conn.execute(
+            "INSERT INTO todos (created_day, state, description, sort_order, created_at) VALUES (?,?,?,?,?)",
+            (day, STATE_PENDING, desc, order, datetime.now(ZoneInfo(TZ)).isoformat(timespec="seconds")),
+        )
+        added += 1
+    conn.commit()
+    return f"Added {added} item(s) to {day}.\n\n" + render(conn)
+
+
+def cmd_list(conn, args) -> str:
+    return render(conn, args.day)
+
+
+def cmd_done(conn, args) -> str:
+    day = args.day or today_str()
+    changed = []
+    for num in args.nums:
+        row = resolve(conn, day, num)
+        conn.execute("UPDATE todos SET state = ? WHERE id = ?", (STATE_DONE, row["id"]))
+        changed.append(row["description"])
+    conn.commit()
+    return f"Marked done ({len(changed)}):\n" + "\n".join(f"  - {d}" for d in changed) + "\n\n" + render(conn)
+
+
+def cmd_undone(conn, args) -> str:
+    day = args.day or today_str()
+    changed = []
+    for num in args.nums:
+        row = resolve(conn, day, num)
+        conn.execute("UPDATE todos SET state = ? WHERE id = ?", (STATE_PENDING, row["id"]))
+        changed.append(row["description"])
+    conn.commit()
+    return f"Marked not-done ({len(changed)}):\n" + "\n".join(f"  - {d}" for d in changed) + "\n\n" + render(conn)
+
+
+def cmd_rm(conn, args) -> str:
+    day = args.day or today_str()
+    removed = []
+    for num in sorted(args.nums, reverse=True):
+        row = resolve(conn, day, num)
+        conn.execute("DELETE FROM todos WHERE id = ?", (row["id"],))
+        removed.append(row["description"])
+    conn.commit()
+    return f"Removed ({len(removed)}):\n" + "\n".join(f"  - {d}" for d in removed) + "\n\n" + render(conn)
+
+
+def cmd_clear(conn, args) -> str:
+    day = args.day or today_str()
+    n = conn.execute("SELECT COUNT(*) AS c FROM todos WHERE created_day = ?", (day,)).fetchone()["c"]
+    if not args.yes:
+        return f"Would delete {n} item(s) for {day}. Re-run with --yes to confirm."
+    conn.execute("DELETE FROM todos WHERE created_day = ?", (day,))
+    conn.commit()
+    return f"Deleted {n} item(s) for {day}.\n\n" + render(conn)
+
+
+# ---------------------------------------------------------------- argparse
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="todo", description="SQLite-backed daily todo list.")
+    p.add_argument("--db", default=DEFAULT_DB, help=f"DB path (default: {DEFAULT_DB})")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def with_day(sp):
+        sp.add_argument("--day", default=None, help="Reference day YYYY-MM-DD (default: today in %s)" % TZ)
+
+    sp = sub.add_parser("init", help="Create the list for a day (fails if non-empty unless --force)")
+    with_day(sp)
+    sp.add_argument("items", nargs="*", help="Items")
+    sp.add_argument("--force", action="store_true", help="Replace existing items for the day")
+    sp.set_defaults(func=cmd_init)
+
+    sp = sub.add_parser("add", help="Add items to a day's list")
+    with_day(sp)
+    sp.add_argument("items", nargs="+")
+    sp.set_defaults(func=cmd_add)
+
+    sp = sub.add_parser("list", aliases=["show"], help="Render the list")
+    with_day(sp)
+    sp.set_defaults(func=cmd_list)
+
+    sp = sub.add_parser("done", help="Mark displayed number(s) done")
+    with_day(sp)
+    sp.add_argument("nums", nargs="+", type=int)
+    sp.set_defaults(func=cmd_done)
+
+    sp = sub.add_parser("undone", help="Mark displayed number(s) not-done")
+    with_day(sp)
+    sp.add_argument("nums", nargs="+", type=int)
+    sp.set_defaults(func=cmd_undone)
+
+    sp = sub.add_parser("rm", aliases=["remove"], help="Remove displayed number(s)")
+    with_day(sp)
+    sp.add_argument("nums", nargs="+", type=int)
+    sp.set_defaults(func=cmd_rm)
+
+    sp = sub.add_parser("clear", help="Delete every item for a day")
+    with_day(sp)
+    sp.add_argument("--yes", action="store_true", help="Confirm deletion")
+    sp.set_defaults(func=cmd_clear)
+
+    return p
+
+
+def main(argv: list[str]) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    with contextlib.closing(connect(args.db)) as conn:
+        try:
+            out = args.func(conn, args)
+        except IndexError as e:
+            print(f"error: no item numbered {e.args[0]} in the current list", file=sys.stderr)
+            return 2
+        except sqlite3.Error as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+    print(out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
