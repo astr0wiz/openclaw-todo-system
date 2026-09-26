@@ -108,6 +108,22 @@ The agent maps chat requests onto the CLI. Canonical phrasings:
 | Payload | `command`: `~/dev/prj/openclaw/todo-system/todo list` |
 | Delivery | announce → telegram:7560164654, best-effort |
 
+### How the three daily runs are used
+
+The three runs are not identical in purpose:
+
+- **6:00 am — the anchor.** Jamie will typically *initiate a new list* right after
+  seeing this display: "initiate a todo list" followed by items one at a time (see
+  the agent interface above). The 6 am view is therefore both the previous day's
+  leftover check and the cue to set up today's list.
+- **12:00 pm — midday reminder.** A check-in on progress; no list creation expected.
+- **6:00 pm — end-of-day reminder.** A closing look at what is still outstanding.
+
+Items get completed *during* the day, not at reminder time: Jamie interacts via
+chat to modify the list (mark done/undone, add, remove) as work happens, and each
+change re-renders the list for verification. The reminders are read-only — they
+never mutate the list and never prompt.
+
 Retired: the previous file-based job `today-todo-reminders`
 (`441569a5-98af-40ea-b712-2f2cdd19f01d`, hourly 9am–5pm) was removed after the
 migration. A one-shot cleanup job referenced in the old Markdown file
